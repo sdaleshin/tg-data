@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,11 @@ class Settings(BaseSettings):
     request_pause: float = 1.0
     pull_interval_seconds: int = 21600
     backfill_resume_interval_seconds: int = 3600
+
+    @field_validator("session_path", mode="before")
+    @classmethod
+    def _expand_session_path(cls, value: str | Path) -> Path:
+        return Path(value).expanduser()
 
 
 settings = Settings()

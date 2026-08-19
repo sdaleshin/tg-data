@@ -22,5 +22,10 @@ RUN uv sync --frozen --group dev
 
 FROM base AS prod
 RUN useradd --create-home --uid 1000 appuser \
-    && chown -R appuser:appuser /app
-USER appuser
+    && chown -R appuser:appuser /app \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["docker-entrypoint.sh"]

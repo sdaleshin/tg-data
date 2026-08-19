@@ -10,8 +10,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from tg_data.config import settings
-from tg_data.db.models import Message, Source, SyncState, ThreadRoot
+from tg_data.db.models import Message, Source, SourceKind, SyncState, ThreadRoot
 from tg_data.fetch.reader import RawMessage, TelegramReaderPort
+from tg_data.report import is_report
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ async def backfill_source(
 
     archive_since = _archive_since()
     saved = 0
+    processed = 0
 
     if state.newest_processed_id is None:
         await _fix_newest_processed_id(source, state, reader, session)
@@ -81,9 +83,18 @@ async def backfill_source(
         if _process_raw(raw, source, state, session):
             saved += 1
 
-        if saved > 0 and saved % CHECKPOINT_EVERY == 0:
+        # Checkpoint по обработанным, а не по сохранённым: длинный участок
+        # медиа без текста иначе прошёл бы без единого commit и обрыв потерял
+        # бы весь прогресс oldest_processed_id.
+        processed += 1
+        if processed % CHECKPOINT_EVERY == 0:
             session.commit()
-            logger.debug("Source %s: checkpoint, сохранено %d сообщений", source.id, saved)
+            logger.debug(
+                "Source %s: checkpoint на %d обработанных, сохранено %d",
+                source.id,
+                processed,
+                saved,
+            )
 
     state.backfill_done = True
     state.last_sync_at = datetime.now(timezone.utc)
@@ -102,7 +113,14 @@ def _process_raw(
     if state.oldest_processed_id is None or raw.tg_msg_id < state.oldest_processed_id:
         state.oldest_processed_id = raw.tg_msg_id
 
-    if raw.is_fwd_saved and raw.saved_from_peer_id is not None:
+    # Только в CommentChat автокопия поста — ThreadRoot. В личном чате те же
+    # saved_from_* поля стоят у любой пересылки себе, и её текст надо хранить,
+    # а не подменять записью о треде.
+    if (
+        source.kind == SourceKind.comment_chat
+        and raw.is_fwd_saved
+        and raw.saved_from_peer_id is not None
+    ):
         channel_source = session.scalar(
             select(Source).where(Source.tg_id == raw.saved_from_peer_id)
         )
@@ -121,6 +139,12 @@ def _process_raw(
                     channel_msg_id=raw.saved_from_msg_id,
                 )
                 session.add(root)
+        return False
+
+    # Свой heartbeat-отчёт в архив не идёт: Saved Messages может быть Source, и
+    # без этой отсечки каждый цикл дописывал бы себе новую строку. Остальные
+    # исходящие — обычный контент и сохраняются.
+    if raw.is_outgoing and is_report(raw.text):
         return False
 
     if not raw.text:

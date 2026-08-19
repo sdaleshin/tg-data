@@ -21,7 +21,8 @@ def advisory_lock(session: Session):
 
     if not result:
         raise LockBusy(
-            "Другой процесс уже работает с Telegram. Дождитесь его завершения."
+            "Другой процесс уже работает с Telegram. Дождитесь его завершения "
+            "или остановите фоновый цикл: make scheduler-stop"
         )
 
     try:

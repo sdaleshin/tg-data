@@ -61,6 +61,9 @@ make auth
 make discover
 ```
 
+Диалог с самим собой помечен `[Избранное]` — по названию его от чата с тёзкой не
+отличить. Личные чаты индексируются наравне с каналами (ADR-0006).
+
 Добавить канал по id или @username:
 
 ```bash
@@ -115,6 +118,16 @@ docker compose exec postgres psql -U tgdata -d tgdata \
 
 Автокопии постов не должны дублироваться в `messages` — только в `thread_roots`.
 
+### topic_id только у форум-топиков
+
+```bash
+docker compose exec postgres psql -U tgdata -d tgdata \
+  -c "SELECT count(topic_id) AS topics, count(reply_to_msg_id) AS replies FROM messages;"
+```
+
+В чате комментариев `replies` будет большим, а `topics` — нулевым: обычный ответ
+топиком не является. Ненулевой `topics` ожидаем только для группы-форума.
+
 ### Продолжение после обрыва
 
 1. Запустите backfill, прервите на середине
@@ -142,7 +155,29 @@ make stats
 ✅ tg-data pull
 Новых сообщений: N
 Источников: M
+#tg_data_report
 ```
+
+Если Избранное добавлено в whitelist, проверьте, что отчёты в архив не попали:
+
+```bash
+docker compose exec postgres psql -U tgdata -d tgdata \
+  -c "SELECT count(*) FROM messages WHERE text LIKE '%#tg_data_report%';"
+```
+
+Должен быть ноль при любом числе прогонов. Маркер `#tg_data_report` — единственное,
+по чему Fetch отличает собственный heartbeat от настоящей заметки (ADR-0006).
+
+### Разовая команда при работающем scheduler
+
+```bash
+make scheduler
+make pull
+```
+
+Между циклами scheduler отпускает и лок, и подключение, поэтому `make pull` проходит.
+Если команда попала ровно в цикл, она завершится кодом 1 и сообщением про занятый
+lock — тогда `make scheduler-stop`.
 
 ## 7. Автотесты
 

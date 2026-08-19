@@ -56,7 +56,7 @@ services:
     profiles: [cli]
     stdin_open: true
     tty: true
-    entrypoint: ["tg"]
+    entrypoint: ["docker-entrypoint.sh", "tg"]
     depends_on:
       migrate:
         condition: service_completed_successfully

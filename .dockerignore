@@ -11,10 +11,6 @@ __pycache__/
 .cursor/
 .agents/
 docs/
-deploy/tg-pull.service
-deploy/tg-pull.timer
-deploy/tg-backfill-resume.service
-deploy/tg-backfill-resume.timer
 plan.md
 skills-lock.json
 tests/__pycache__/

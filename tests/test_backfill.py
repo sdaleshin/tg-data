@@ -9,10 +9,10 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from tg_data.db.engine import engine
 from tg_data.db.models import Message, Source, SourceKind, SyncState, ThreadRoot
 from tg_data.fetch.backfill import backfill_source
 from tg_data.fetch.reader import RawMessage
+from tg_data.report import pull_report
 
 
 def make_raw(
@@ -22,6 +22,7 @@ def make_raw(
     is_fwd_saved: bool = False,
     saved_from_peer_id: int | None = None,
     saved_from_msg_id: int | None = None,
+    is_outgoing: bool = False,
 ) -> RawMessage:
     return RawMessage(
         tg_msg_id=tg_msg_id,
@@ -39,6 +40,7 @@ def make_raw(
         is_fwd_saved=is_fwd_saved,
         saved_from_peer_id=saved_from_peer_id,
         saved_from_msg_id=saved_from_msg_id,
+        is_outgoing=is_outgoing,
     )
 
 
@@ -69,8 +71,10 @@ class StubReader:
         return {"tg_id": tg_id, "username": None, "title": "Test"}
 
 
-def make_source(session: Session, tg_id: int = 100) -> Source:
-    source = Source(tg_id=tg_id, kind=SourceKind.channel, title="Test Channel")
+def make_source(
+    session: Session, tg_id: int = 100, kind: SourceKind = SourceKind.channel
+) -> Source:
+    source = Source(tg_id=tg_id, kind=kind, title="Test Channel")
     session.add(source)
     session.flush()
     return source
@@ -112,6 +116,104 @@ async def test_backfill_skips_messages_without_text(session: Session) -> None:
 
 
 @pytest.mark.asyncio
+async def test_backfill_skips_own_heartbeat_report(session: Session) -> None:
+    """Свой отчёт в архив не идёт, а остальные исходящие — идут."""
+    source = make_source(session, tg_id=1008, kind=SourceKind.private)
+    messages = [
+        make_raw(
+            30,
+            datetime(2024, 6, 1, tzinfo=timezone.utc),
+            text=pull_report(0, 4),
+            is_outgoing=True,
+        ),
+        make_raw(
+            29,
+            datetime(2024, 5, 1, tzinfo=timezone.utc),
+            text="моя заметка себе",
+            is_outgoing=True,
+        ),
+    ]
+    reader = StubReader(messages)
+
+    saved = await backfill_source(source, reader, session)
+
+    assert saved == 1
+    msgs = session.query(Message).filter_by(source_id=source.id).all()
+    assert [m.tg_msg_id for m in msgs] == [29]
+
+
+@pytest.mark.asyncio
+async def test_private_forward_is_archived_not_turned_into_thread_root(
+    session: Session,
+) -> None:
+    """Пересылка себе — контент, а не ThreadRoot.
+
+    saved_from_* стоят у любой пересылки, поэтому вне CommentChat их нельзя
+    принимать за автокопию поста канала: иначе текст молча теряется.
+    """
+    channel = make_source(session, tg_id=9100)
+    saved_messages = make_source(session, tg_id=9101, kind=SourceKind.private)
+
+    messages = [
+        make_raw(
+            200,
+            datetime(2024, 6, 1, tzinfo=timezone.utc),
+            text="переслал себе важный пост",
+            is_fwd_saved=True,
+            saved_from_peer_id=9100,
+            saved_from_msg_id=7,
+            is_outgoing=True,
+        ),
+    ]
+
+    saved = await backfill_source(saved_messages, StubReader(messages), session)
+
+    assert saved == 1
+    msgs = session.query(Message).filter_by(source_id=saved_messages.id).all()
+    assert [m.text for m in msgs] == ["переслал себе важный пост"]
+    assert session.query(ThreadRoot).filter_by(channel_source_id=channel.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_checkpoints_without_saved_messages(
+    session: Session, db_engine, monkeypatch
+) -> None:
+    """Участок без текста тоже коммитит прогресс oldest_processed_id."""
+    import tg_data.fetch.backfill as bf_module
+
+    monkeypatch.setattr(bf_module, "CHECKPOINT_EVERY", 2)
+
+    source = make_source(session, tg_id=1009)
+    source_id = source.id
+    messages = [
+        make_raw(50, datetime(2024, 6, 1, tzinfo=timezone.utc), text=None),
+        make_raw(49, datetime(2024, 6, 1, tzinfo=timezone.utc), text=None),
+        make_raw(48, datetime(2024, 6, 1, tzinfo=timezone.utc), text=None),
+    ]
+
+    class Interrupted(Exception):
+        pass
+
+    class FailingReader(StubReader):
+        async def iter_messages(self, tg_id: int, **kwargs):
+            count = 0
+            async for m in super().iter_messages(tg_id, **kwargs):
+                yield m
+                count += 1
+                if count == 2:
+                    raise Interrupted
+
+    with pytest.raises(Interrupted):
+        await backfill_source(source, FailingReader(messages), session)
+
+    with Session(db_engine) as fresh:
+        state = fresh.get(SyncState, source_id)
+        assert state is not None
+        assert state.oldest_processed_id == 49
+        assert state.backfill_done is False
+
+
+@pytest.mark.asyncio
 async def test_backfill_stops_at_archive_boundary(session: Session, monkeypatch) -> None:
     source = make_source(session, tg_id=1003)
 
@@ -137,7 +239,9 @@ async def test_backfill_stops_at_archive_boundary(session: Session, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_backfill_commits_on_archive_boundary(session: Session, monkeypatch) -> None:
+async def test_backfill_commits_on_archive_boundary(
+    session: Session, db_engine, monkeypatch
+) -> None:
     source = make_source(session, tg_id=1006)
     source_id = source.id
 
@@ -157,7 +261,7 @@ async def test_backfill_commits_on_archive_boundary(session: Session, monkeypatc
     await backfill_source(source, reader, session)
     session.commit()
 
-    with Session(engine) as fresh:
+    with Session(db_engine) as fresh:
         count = fresh.scalar(
             select(func.count())
             .select_from(Message)
