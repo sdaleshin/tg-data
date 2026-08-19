@@ -1,0 +1,193 @@
+"""Тесты backfill на заглушке без сети."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy.orm import Session
+
+from tg_data.db.models import Message, Source, SourceKind, SyncState, ThreadRoot
+from tg_data.fetch.backfill import backfill_source
+from tg_data.fetch.reader import RawMessage
+
+
+def make_raw(
+    tg_msg_id: int,
+    date: datetime,
+    text: str | None = "hello",
+    is_fwd_saved: bool = False,
+    saved_from_peer_id: int | None = None,
+    saved_from_msg_id: int | None = None,
+) -> RawMessage:
+    return RawMessage(
+        tg_msg_id=tg_msg_id,
+        date=date,
+        edit_date=None,
+        text=text,
+        entities=None,
+        reply_to_msg_id=None,
+        reply_to_top_id=None,
+        grouped_id=None,
+        topic_id=None,
+        fwd_from=None,
+        views=None,
+        reactions=None,
+        is_fwd_saved=is_fwd_saved,
+        saved_from_peer_id=saved_from_peer_id,
+        saved_from_msg_id=saved_from_msg_id,
+    )
+
+
+class StubReader:
+    def __init__(self, messages: list[RawMessage]) -> None:
+        self._messages = messages
+
+    async def iter_messages(
+        self,
+        tg_id: int,
+        *,
+        min_id: int = 0,
+        max_id: int = 0,
+        limit: int | None = None,
+    ) -> AsyncIterator[RawMessage]:
+        for m in self._messages:
+            if max_id and m.tg_msg_id >= max_id:
+                continue
+            if min_id and m.tg_msg_id <= min_id:
+                continue
+            yield m
+
+    async def get_chat_info(self, tg_id: int) -> dict:
+        return {"tg_id": tg_id, "username": None, "title": "Test"}
+
+
+def make_source(session: Session, tg_id: int = 100) -> Source:
+    source = Source(tg_id=tg_id, kind=SourceKind.channel, title="Test Channel")
+    session.add(source)
+    session.flush()
+    return source
+
+
+@pytest.mark.asyncio
+async def test_backfill_saves_messages_with_text(session: Session) -> None:
+    source = make_source(session, tg_id=1001)
+    messages = [
+        make_raw(10, datetime(2024, 6, 1, tzinfo=timezone.utc), text="msg 10"),
+        make_raw(9, datetime(2024, 5, 1, tzinfo=timezone.utc), text="msg 9"),
+        make_raw(8, datetime(2024, 2, 1, tzinfo=timezone.utc), text="msg 8"),
+    ]
+    reader = StubReader(messages)
+
+    saved = await backfill_source(source, reader, session)
+
+    assert saved == 3
+    msgs = session.query(Message).filter_by(source_id=source.id).all()
+    assert len(msgs) == 3
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_messages_without_text(session: Session) -> None:
+    source = make_source(session, tg_id=1002)
+    messages = [
+        make_raw(5, datetime(2024, 3, 1, tzinfo=timezone.utc), text="has text"),
+        make_raw(4, datetime(2024, 2, 1, tzinfo=timezone.utc), text=None),
+        make_raw(3, datetime(2024, 1, 15, tzinfo=timezone.utc), text=""),
+    ]
+    reader = StubReader(messages)
+
+    saved = await backfill_source(source, reader, session)
+
+    assert saved == 1
+    msgs = session.query(Message).filter_by(source_id=source.id).all()
+    assert len(msgs) == 1
+    assert msgs[0].tg_msg_id == 5
+
+
+@pytest.mark.asyncio
+async def test_backfill_stops_at_archive_boundary(session: Session, monkeypatch) -> None:
+    source = make_source(session, tg_id=1003)
+
+    import tg_data.fetch.backfill as bf_module
+    monkeypatch.setattr(
+        bf_module,
+        "_archive_since",
+        lambda: datetime(2024, 3, 1, tzinfo=timezone.utc),
+    )
+
+    messages = [
+        make_raw(20, datetime(2024, 6, 1, tzinfo=timezone.utc), text="after"),
+        make_raw(15, datetime(2024, 4, 1, tzinfo=timezone.utc), text="after2"),
+        make_raw(10, datetime(2024, 2, 1, tzinfo=timezone.utc), text="before boundary"),
+    ]
+    reader = StubReader(messages)
+
+    saved = await backfill_source(source, reader, session)
+
+    assert saved == 2
+    msgs = session.query(Message).filter_by(source_id=source.id).all()
+    assert all(m.tg_msg_id in (20, 15) for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_backfill_marks_done(session: Session) -> None:
+    source = make_source(session, tg_id=1004)
+    reader = StubReader([
+        make_raw(1, datetime(2024, 6, 1, tzinfo=timezone.utc), text="only"),
+    ])
+
+    await backfill_source(source, reader, session)
+
+    state = session.get(SyncState, source.id)
+    assert state is not None
+    assert state.backfill_done is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_thread_roots_and_creates_record(session: Session) -> None:
+    channel = make_source(session, tg_id=9000)
+    comment_chat = Source(
+        tg_id=9001,
+        kind=SourceKind.comment_chat,
+        title="CommentChat",
+        linked_channel_id=9000,
+    )
+    session.add(comment_chat)
+    session.flush()
+
+    messages = [
+        make_raw(
+            100,
+            datetime(2024, 6, 1, tzinfo=timezone.utc),
+            text="original post",
+            is_fwd_saved=True,
+            saved_from_peer_id=9000,
+            saved_from_msg_id=50,
+        ),
+        make_raw(101, datetime(2024, 6, 1, tzinfo=timezone.utc), text="comment"),
+    ]
+    reader = StubReader(messages)
+
+    saved = await backfill_source(comment_chat, reader, session)
+
+    assert saved == 1
+    roots = session.query(ThreadRoot).filter_by(source_id=comment_chat.id).all()
+    assert len(roots) == 1
+    assert roots[0].root_msg_id == 100
+    assert roots[0].channel_source_id == channel.id
+    assert roots[0].channel_msg_id == 50
+
+
+@pytest.mark.asyncio
+async def test_backfill_idempotent(session: Session) -> None:
+    source = make_source(session, tg_id=1005)
+    messages = [make_raw(7, datetime(2024, 6, 1, tzinfo=timezone.utc), text="text")]
+    reader = StubReader(messages)
+
+    await backfill_source(source, reader, session)
+    await backfill_source(source, reader, session)
+
+    msgs = session.query(Message).filter_by(source_id=source.id).all()
+    assert len(msgs) == 1

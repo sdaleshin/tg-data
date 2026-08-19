@@ -1,0 +1,12 @@
+[Unit]
+Description=tg-data incremental pull
+After=network.target
+
+[Service]
+Type=oneshot
+User=%i
+WorkingDirectory=/opt/tg-data
+ExecStart=/opt/tg-data/.venv/bin/tg pull
+EnvironmentFile=/opt/tg-data/.env
+StandardOutput=journal
+StandardError=journal
