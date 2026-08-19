@@ -1,0 +1,9 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.session
+*.session-journal
+~/.tg-data/
