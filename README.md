@@ -9,45 +9,47 @@
 
 - Python 3.12 + uv
 - Telethon 1.44 (личный аккаунт)
-- Postgres 17 (docker-compose)
+- Postgres 17 (Docker)
 - SQLAlchemy 2.0 + Alembic, Typer, pydantic-settings
 
-## Быстрый старт
+## Быстрый старт (Docker)
 
 ```bash
-# Установить зависимости
-uv sync
+# Настроить окружение
+cp .env.example .env
+# Заполнить TELEGRAM_API_ID, TELEGRAM_API_HASH
 
-# Запустить Postgres
-docker compose up -d
+# Собрать и запустить
+docker compose build
+docker compose up -d postgres
+docker compose run --rm migrate
 
-# Применить миграции
-uv run alembic upgrade head
-
-# Войти в аккаунт
-uv run tg auth
+# Войти в аккаунт (интерактивно)
+docker compose --profile cli run --rm tg auth
 
 # Добавить источники
-uv run tg sources discover       # найти чаты
-uv run tg sources add <tg_id>    # добавить по id
-uv run tg sources sync           # обновить метаданные + автодобавить comment_chat
+docker compose --profile cli run --rm tg sources discover
+docker compose --profile cli run --rm tg sources add @channel_or_id
+docker compose --profile cli run --rm tg sources sync
 
 # Выкачать историю
-uv run tg pull --backfill        # backfill до границы архива
+docker compose --profile cli run --rm tg pull --backfill
 
-# Инкремент
-uv run tg pull                   # только новые сообщения
+# Запустить фоновый scheduler (инкремент + добор backfill)
+docker compose up -d scheduler
 
 # Статистика
-uv run tg stats
+docker compose --profile cli run --rm tg stats
 ```
+
+Подробный сценарий локального теста: [docs/local-test.md](docs/local-test.md).
 
 ## CLI
 
 | Команда | Описание |
 |---------|----------|
 | `tg auth` | Войти в Telegram |
-| `tg sources add <id>` | Добавить Source |
+| `tg sources add <id\|@username>` | Добавить Source |
 | `tg sources disable <id>` | Деактивировать |
 | `tg sources enable <id>` | Активировать |
 | `tg sources list` | Список источников |
@@ -57,7 +59,18 @@ uv run tg stats
 | `tg pull` | Инкрементальный pull |
 | `tg pull --backfill` | Backfill до границы архива |
 | `tg pull --backfill --resume-all` | Добрать незавершённые backfill |
+| `tg scheduler` | Фоновый цикл pull + backfill |
 | `tg stats` | Статистика |
+
+## Разработка без Docker
+
+```bash
+uv sync
+docker compose up -d postgres   # только БД
+uv run alembic upgrade head
+uv run tg auth
+uv run pytest
+```
 
 ## Деплой
 

@@ -1,56 +1,68 @@
 # Деплой на VPS
 
+Весь стек работает через Docker Compose — те же команды, что и локально.
+
 ## Требования
 
-- Ubuntu 22.04+
-- Docker + docker-compose (для Postgres)
-- Python 3.12 + uv
+- Ubuntu 22.04+ (или любой Linux с Docker)
+- Docker + Docker Compose v2
+- SSH-доступ к серверу
 
 ## Установка
 
 ```bash
 # 1. Клонировать репозиторий
-git clone ... /opt/tg-data
+git clone git@github.com:sdaleshin/tg-data.git /opt/tg-data
 cd /opt/tg-data
 
 # 2. Создать .env
 cp .env.example .env
 # Заполнить TELEGRAM_API_ID, TELEGRAM_API_HASH
 
-# 3. Запустить Postgres
-docker compose up -d
+# 3. Собрать и запустить
+docker compose build
+docker compose up -d postgres
+docker compose run --rm migrate
 
-# 4. Создать виртуальное окружение и установить зависимости
-uv sync
+# 4. Войти в Telegram-аккаунт (интерактивно по SSH)
+docker compose --profile cli run --rm tg auth
 
-# 5. Применить миграции
-uv run alembic upgrade head
+# 5. Добавить источники
+docker compose --profile cli run --rm tg sources add <tg_id>
+docker compose --profile cli run --rm tg sources sync
 
-# 6. Войти в Telegram-аккаунт (интерактивно)
-uv run tg auth
+# 6. Первый backfill
+docker compose --profile cli run --rm tg pull --backfill
 
-# 7. Добавить источники
-uv run tg sources add <tg_id>
-uv run tg sources sync  # автодобавит comment_chat
-
-# 8. Запустить первый backfill вручную (или через systemd)
-uv run tg pull --backfill
+# 7. Запустить scheduler (инкремент каждые 6ч + добор backfill каждый час)
+docker compose up -d scheduler
 ```
 
-## Systemd timers
+## Обновление
 
 ```bash
-# Скопировать unit-файлы
-sudo cp deploy/tg-pull.service /etc/systemd/system/
-sudo cp deploy/tg-pull.timer /etc/systemd/system/
-sudo cp deploy/tg-backfill-resume.service /etc/systemd/system/
-sudo cp deploy/tg-backfill-resume.timer /etc/systemd/system/
-
-# Включить таймеры
-sudo systemctl daemon-reload
-sudo systemctl enable --now tg-pull.timer
-sudo systemctl enable --now tg-backfill-resume.timer
+cd /opt/tg-data
+git pull
+docker compose build
+docker compose run --rm migrate
+docker compose up -d scheduler
 ```
+
+## Мониторинг
 
 Отчёты о каждом прогоне приходят в Saved Messages Telegram-аккаунта.
 Отсутствие отчёта — сигнал о проблеме.
+
+Логи scheduler:
+
+```bash
+docker compose logs -f scheduler
+```
+
+## Бэкап Postgres
+
+```bash
+docker compose exec postgres pg_dump -U tgdata tgdata > backup.sql
+```
+
+Сессия Telethon хранится в томе `tg_session` — при `docker compose down -v` она удалится.
