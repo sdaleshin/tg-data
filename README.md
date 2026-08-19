@@ -15,6 +15,25 @@
 ## Быстрый старт (Docker)
 
 ```bash
+make env          # создать .env из .env.example
+# заполнить TELEGRAM_API_ID, TELEGRAM_API_HASH
+
+make init         # build + postgres + migrate
+make auth         # войти в Telegram
+make discover     # найти чаты
+make sources-add PEER=@your_channel
+make sources-sync
+make pull-backfill
+make scheduler    # фоновый инкремент + добор backfill
+make stats
+```
+
+Все команды: `make help`.
+
+<details>
+<summary>Эквивалент через docker compose</summary>
+
+```bash
 # Настроить окружение
 cp .env.example .env
 # Заполнить TELEGRAM_API_ID, TELEGRAM_API_HASH
@@ -41,6 +60,8 @@ docker compose up -d scheduler
 # Статистика
 docker compose --profile cli run --rm tg stats
 ```
+
+</details>
 
 Подробный сценарий локального теста: [docs/local-test.md](docs/local-test.md).
 

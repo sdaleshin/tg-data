@@ -20,22 +20,20 @@ cp .env.example .env
 # Заполнить TELEGRAM_API_ID, TELEGRAM_API_HASH
 
 # 3. Собрать и запустить
-docker compose build
-docker compose up -d postgres
-docker compose run --rm migrate
+make init
 
 # 4. Войти в Telegram-аккаунт (интерактивно по SSH)
-docker compose --profile cli run --rm tg auth
+make auth
 
 # 5. Добавить источники
-docker compose --profile cli run --rm tg sources add <tg_id>
-docker compose --profile cli run --rm tg sources sync
+make sources-add PEER=<tg_id>
+make sources-sync
 
 # 6. Первый backfill
-docker compose --profile cli run --rm tg pull --backfill
+make pull-backfill
 
 # 7. Запустить scheduler (инкремент каждые 6ч + добор backfill каждый час)
-docker compose up -d scheduler
+make scheduler
 ```
 
 ## Обновление

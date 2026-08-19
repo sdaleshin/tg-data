@@ -32,15 +32,15 @@ BACKFILL_RESUME_INTERVAL_SECONDS=120
 ## 2. Сборка и запуск инфраструктуры
 
 ```bash
-docker compose build
-docker compose up -d postgres
-docker compose run --rm migrate
+make init
+# или по шагам: make build && make up && make migrate
 ```
 
 Проверка Postgres:
 
 ```bash
-docker compose exec postgres psql -U tgdata -d tgdata -c '\dt'
+make psql-messages
+# или: docker compose exec postgres psql -U tgdata -d tgdata -c '\dt'
 ```
 
 ## 3. Авторизация в Telegram
@@ -48,7 +48,7 @@ docker compose exec postgres psql -U tgdata -d tgdata -c '\dt'
 Интерактивная команда — нужен терминал:
 
 ```bash
-docker compose --profile cli run --rm tg auth
+make auth
 ```
 
 Введите номер телефона и код из Telegram. Сессия сохранится в томе `tg_session`.
@@ -58,32 +58,32 @@ docker compose --profile cli run --rm tg auth
 Найти чаты аккаунта:
 
 ```bash
-docker compose --profile cli run --rm tg sources discover
+make discover
 ```
 
 Добавить канал по id или @username:
 
 ```bash
-docker compose --profile cli run --rm tg sources add -1001234567890
-docker compose --profile cli run --rm tg sources add @your_test_channel
+make sources-add PEER=-1001234567890
+make sources-add PEER=@your_test_channel
 ```
 
 Автодобавить CommentChat для каналов:
 
 ```bash
-docker compose --profile cli run --rm tg sources sync
+make sources-sync
 ```
 
 Проверить whitelist:
 
 ```bash
-docker compose --profile cli run --rm tg sources list
+make sources-list
 ```
 
 ## 5. Backfill
 
 ```bash
-docker compose --profile cli run --rm tg pull --backfill
+make pull-backfill
 ```
 
 Для длинного backfill можно прервать (`Ctrl+C`) и продолжить позже — checkpoint в `sync_state.oldest_processed_id` сохраняется.
@@ -93,15 +93,13 @@ docker compose --profile cli run --rm tg pull --backfill
 ### Сообщения в БД
 
 ```bash
-docker compose exec postgres psql -U tgdata -d tgdata \
-  -c "SELECT count(*) FROM messages;"
+make psql-messages
 ```
 
 ### newest_processed_id зафиксирован
 
 ```bash
-docker compose exec postgres psql -U tgdata -d tgdata \
-  -c "SELECT source_id, newest_processed_id, backfill_done FROM sync_state;"
+make psql-sync-state
 ```
 
 `newest_processed_id` не должен быть NULL или 0 после backfill канала с сообщениями.
@@ -121,19 +119,19 @@ docker compose exec postgres psql -U tgdata -d tgdata \
 
 1. Запустите backfill, прервите на середине
 2. Проверьте `oldest_processed_id` в `sync_state`
-3. Запустите снова: `docker compose --profile cli run --rm tg pull --backfill --resume-all`
+3. Запустите снова: `make pull-resume`
 4. Убедитесь, что сообщения не дублируются (`UNIQUE(source_id, tg_msg_id)`)
 
 ### Инкремент через scheduler
 
 ```bash
-docker compose up -d scheduler
+make scheduler
 ```
 
 Опубликуйте новый пост в тестовом канале, подождите `PULL_INTERVAL_SECONDS`, проверьте:
 
 ```bash
-docker compose --profile cli run --rm tg stats
+make stats
 ```
 
 ### Heartbeat в Saved Messages
@@ -149,13 +147,13 @@ docker compose --profile cli run --rm tg stats
 ## 7. Автотесты
 
 ```bash
-docker compose --profile tools run --rm tests
+make test
 ```
 
 ## 8. Остановка
 
 ```bash
-docker compose down
+make down
 ```
 
 Данные Postgres и сессия Telegram сохраняются в томах `postgres_data` и `tg_session`.
@@ -163,5 +161,5 @@ docker compose down
 Полная очистка:
 
 ```bash
-docker compose down -v
+make down-v
 ```
