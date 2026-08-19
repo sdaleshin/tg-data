@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from tg_data.db.engine import engine
 from tg_data.db.models import Message, Source, SourceKind, SyncState, ThreadRoot
 from tg_data.fetch.backfill import backfill_source
 from tg_data.fetch.reader import RawMessage
@@ -53,12 +54,16 @@ class StubReader:
         max_id: int = 0,
         limit: int | None = None,
     ) -> AsyncIterator[RawMessage]:
+        count = 0
         for m in self._messages:
             if max_id and m.tg_msg_id >= max_id:
                 continue
             if min_id and m.tg_msg_id <= min_id:
                 continue
             yield m
+            count += 1
+            if limit is not None and count >= limit:
+                return
 
     async def get_chat_info(self, tg_id: int) -> dict:
         return {"tg_id": tg_id, "username": None, "title": "Test"}
@@ -129,6 +134,52 @@ async def test_backfill_stops_at_archive_boundary(session: Session, monkeypatch)
     assert saved == 2
     msgs = session.query(Message).filter_by(source_id=source.id).all()
     assert all(m.tg_msg_id in (20, 15) for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_backfill_commits_on_archive_boundary(session: Session, monkeypatch) -> None:
+    source = make_source(session, tg_id=1006)
+    source_id = source.id
+
+    import tg_data.fetch.backfill as bf_module
+    monkeypatch.setattr(
+        bf_module,
+        "_archive_since",
+        lambda: datetime(2024, 3, 1, tzinfo=timezone.utc),
+    )
+
+    messages = [
+        make_raw(20, datetime(2024, 6, 1, tzinfo=timezone.utc), text="after"),
+        make_raw(10, datetime(2024, 2, 1, tzinfo=timezone.utc), text="before boundary"),
+    ]
+    reader = StubReader(messages)
+
+    await backfill_source(source, reader, session)
+    session.commit()
+
+    with Session(engine) as fresh:
+        count = fresh.scalar(
+            select(func.count())
+            .select_from(Message)
+            .where(Message.source_id == source_id)
+        )
+        assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_sets_newest_processed_id(session: Session) -> None:
+    source = make_source(session, tg_id=1007)
+    messages = [
+        make_raw(10, datetime(2024, 6, 1, tzinfo=timezone.utc), text="msg 10"),
+        make_raw(9, datetime(2024, 5, 1, tzinfo=timezone.utc), text="msg 9"),
+    ]
+    reader = StubReader(messages)
+
+    await backfill_source(source, reader, session)
+
+    state = session.get(SyncState, source.id)
+    assert state is not None
+    assert state.newest_processed_id == 10
 
 
 @pytest.mark.asyncio

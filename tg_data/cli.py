@@ -1,15 +1,17 @@
-"""CLI точка входа — команды: auth, sources, pull, stats."""
+"""CLI точка входа — команды: auth, sources, pull, stats, scheduler."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Annotated
 
 import typer
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from tg_data.config import settings
 from tg_data.db.engine import engine
 from tg_data.db.models import InactiveReason, Message, Source, SourceKind, SyncState
 
@@ -18,6 +20,7 @@ sources_app = typer.Typer(help="Управление whitelist источник�
 app.add_typer(sources_app, name="sources")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 
 # ─── auth ────────────────────────────────────────────────────────────────────
@@ -43,7 +46,7 @@ def auth() -> None:
 
 @sources_app.command("add")
 def sources_add(
-    tg_id: Annotated[int, typer.Argument(help="Telegram peer id или @username")],
+    peer: Annotated[str, typer.Argument(help="Telegram peer id или @username")],
     kind: Annotated[SourceKind, typer.Option(help="Тип источника")] = SourceKind.channel,
 ) -> None:
     """Добавить Source в whitelist."""
@@ -55,7 +58,8 @@ def sources_add(
         try:
             from tg_data.fetch.reader import TelegramReader
             reader = TelegramReader(client)
-            info = await reader.get_chat_info(tg_id)
+            lookup: int | str = int(peer) if peer.lstrip("-").isdigit() else peer
+            info = await reader.get_chat_info(lookup)
         finally:
             await client.disconnect()
 
@@ -259,86 +263,158 @@ def sources_sync() -> None:
     asyncio.run(_sync())
 
 
-# ─── pull ─────────────────────────────────────────────────────────────────────
+# ─── pull / scheduler ────────────────────────────────────────────────────────
+
+
+async def run_pull(
+    client,
+    *,
+    backfill: bool = False,
+    resume_all: bool = False,
+) -> tuple[int, int]:
+    """Выкачать сообщения. Возвращает (total_messages, sources_count)."""
+    from tg_data.fetch.advisory_lock import advisory_lock
+    from tg_data.fetch.reader import TelegramReader
+
+    reader = TelegramReader(client)
+
+    with Session(engine) as session:
+        with advisory_lock(session):
+            if backfill:
+                if resume_all:
+                    sources = session.scalars(
+                        select(Source)
+                        .join(SyncState, Source.id == SyncState.source_id)
+                        .where(
+                            Source.is_active.is_(True),
+                            SyncState.backfill_done.is_(False),
+                        )
+                    ).all()
+                else:
+                    sources = session.scalars(
+                        select(Source).where(Source.is_active.is_(True))
+                    ).all()
+
+                total = 0
+                for source in sources:
+                    from tg_data.fetch.backfill import backfill_source
+                    n = await backfill_source(source, reader, session)
+                    total += n
+                    typer.echo(f"  Source {source.id}: +{n} сообщений")
+
+                typer.echo(f"Backfill: {total} сообщений по {len(sources)} источникам")
+            else:
+                sources = session.scalars(
+                    select(Source)
+                    .join(SyncState, Source.id == SyncState.source_id)
+                    .where(
+                        Source.is_active.is_(True),
+                        SyncState.backfill_done.is_(True),
+                    )
+                ).all()
+
+                total = 0
+                for source in sources:
+                    from tg_data.fetch.increment import increment_source
+                    n = await increment_source(source, reader, session)
+                    total += n
+
+                typer.echo(f"Инкремент: {total} новых сообщений по {len(sources)} источникам")
+
+            await _send_report(client, total, len(sources), ok=True)
+            return total, len(sources)
+
+
+async def _send_report(
+    client,
+    total: int,
+    sources_count: int,
+    *,
+    ok: bool = True,
+    error: str | None = None,
+) -> None:
+    try:
+        if ok:
+            text = (
+                f"✅ tg-data pull\n"
+                f"Новых сообщений: {total}\n"
+                f"Источников: {sources_count}"
+            )
+        else:
+            text = f"❌ tg-data error\n{error}"
+        await client.send_message("me", text)
+    except Exception as e:
+        logging.warning("Не удалось отправить отчёт в Saved Messages: %s", e)
 
 
 @app.command()
 def pull(
     backfill: Annotated[bool, typer.Option(help="Backfill до границы архива")] = False,
-    resume_all: Annotated[bool, typer.Option("--resume-all", help="Добрать все незавершённые backfill")] = False,
+    resume_all: Annotated[
+        bool, typer.Option("--resume-all", help="Добрать все незавершённые backfill")
+    ] = False,
 ) -> None:
     """Выкачать сообщения из Telegram в Postgres."""
-    from tg_data.fetch.advisory_lock import advisory_lock
+    from tg_data.fetch.advisory_lock import LockBusy
     from tg_data.fetch.client import make_client
 
     async def _pull() -> None:
         client = make_client()
         await client.start()
         try:
-            from tg_data.fetch.reader import TelegramReader
-            reader = TelegramReader(client)
-
-            with Session(engine) as session:
-                with advisory_lock(session):
-                    if backfill:
-                        if resume_all:
-                            sources = session.scalars(
-                                select(Source)
-                                .join(SyncState, Source.id == SyncState.source_id)
-                                .where(
-                                    Source.is_active.is_(True),
-                                    SyncState.backfill_done.is_(False),
-                                )
-                            ).all()
-                        else:
-                            sources = session.scalars(
-                                select(Source).where(Source.is_active.is_(True))
-                            ).all()
-
-                        total = 0
-                        for source in sources:
-                            from tg_data.fetch.backfill import backfill_source
-                            n = await backfill_source(source, reader, session)
-                            total += n
-                            typer.echo(f"  Source {source.id}: +{n} сообщений")
-
-                        typer.echo(f"Backfill: {total} сообщений по {len(sources)} источникам")
-                    else:
-                        sources = session.scalars(
-                            select(Source)
-                            .join(SyncState, Source.id == SyncState.source_id)
-                            .where(
-                                Source.is_active.is_(True),
-                                SyncState.backfill_done.is_(True),
-                            )
-                        ).all()
-
-                        total = 0
-                        for source in sources:
-                            from tg_data.fetch.increment import increment_source
-                            n = await increment_source(source, reader, session)
-                            total += n
-
-                        typer.echo(f"Инкремент: {total} новых сообщений по {len(sources)} источникам")
-
-                    await _send_report(client, total, len(sources))
+            await run_pull(client, backfill=backfill, resume_all=resume_all)
+        except LockBusy as e:
+            typer.echo(str(e))
+            raise typer.Exit(1) from e
         finally:
             await client.disconnect()
 
     asyncio.run(_pull())
 
 
-async def _send_report(client, total: int, sources_count: int) -> None:
-    try:
-        me = await client.get_me()
-        text = (
-            f"✅ tg-data pull\n"
-            f"Новых сообщений: {total}\n"
-            f"Источников: {sources_count}"
+@app.command()
+def scheduler() -> None:
+    """Фоновый цикл: добор backfill + инкремент по расписанию."""
+    from tg_data.fetch.advisory_lock import LockBusy
+    from tg_data.fetch.client import make_client
+
+    async def _scheduler() -> None:
+        client = make_client()
+        await client.start()
+        typer.echo(
+            f"Scheduler запущен: backfill каждые {settings.backfill_resume_interval_seconds}s, "
+            f"инкремент каждые {settings.pull_interval_seconds}s"
         )
-        await client.send_message("me", text)
-    except Exception as e:
-        logging.warning("Не удалось отправить отчёт в Saved Messages: %s", e)
+        last_backfill = 0.0
+        last_pull = 0.0
+        try:
+            while True:
+                now = time.monotonic()
+                if now - last_backfill >= settings.backfill_resume_interval_seconds:
+                    try:
+                        await run_pull(client, backfill=True, resume_all=True)
+                    except LockBusy:
+                        logger.info("Backfill пропущен: другой процесс держит lock")
+                    except Exception as e:
+                        logger.exception("Ошибка backfill")
+                        await _send_report(client, 0, 0, ok=False, error=str(e))
+                    last_backfill = now
+
+                if now - last_pull >= settings.pull_interval_seconds:
+                    try:
+                        await run_pull(client, backfill=False)
+                    except LockBusy:
+                        logger.info("Инкремент пропущен: другой процесс держит lock")
+                    except Exception as e:
+                        logger.exception("Ошибка инкремента")
+                        await _send_report(client, 0, 0, ok=False, error=str(e))
+                    last_pull = now
+
+                await asyncio.sleep(60)
+        finally:
+            await client.disconnect()
+
+    asyncio.run(_scheduler())
 
 
 # ─── stats ────────────────────────────────────────────────────────────────────

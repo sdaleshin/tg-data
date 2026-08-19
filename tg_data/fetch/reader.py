@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from tg_data.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,14 +51,25 @@ class TelegramReaderPort(Protocol):
         limit: int | None = None,
     ) -> AsyncIterator[RawMessage]: ...
 
-    async def get_chat_info(self, tg_id: int) -> dict: ...
+    async def get_chat_info(self, tg_id: int | str) -> dict: ...
+
+
+def _resolve_topic_id(
+    reply_to_msg_id: int | None,
+    reply_to_top_id: int | None,
+) -> int | None:
+    """Топик форума: reply_to_top_id или reply_to_msg_id для корня топика."""
+    if reply_to_top_id is not None:
+        return reply_to_top_id
+    if reply_to_msg_id is not None:
+        return reply_to_msg_id
+    return None
 
 
 class TelegramReader:
     """Реальная реализация TelegramReaderPort поверх Telethon."""
 
     FLOOD_WAIT_EXTRA = 5
-    MESSAGE_PAUSE = 1.0
 
     def __init__(self, client) -> None:  # noqa: ANN001
         self._client = client
@@ -70,13 +83,9 @@ class TelegramReader:
         limit: int | None = None,
     ) -> AsyncIterator[RawMessage]:
         from telethon.errors import FloodWaitError
-        from telethon.tl.types import (
-            MessageFwdHeader,
-            MessageEntityMention,
-            PeerChannel,
-        )
+        from telethon.tl.types import MessageFwdHeader, PeerChannel
 
-        kwargs: dict = {"reverse": False}
+        kwargs: dict = {"reverse": False, "wait_time": settings.request_pause}
         if min_id:
             kwargs["min_id"] = min_id
         if max_id:
@@ -149,11 +158,7 @@ class TelegramReader:
                             for e in entities
                         ]
 
-                    topic_id: int | None = None
-                    if reply_to_top_id is not None:
-                        topic_id = reply_to_top_id
-                    elif getattr(msg, "reply_to", None) is not None:
-                        topic_id = getattr(msg.reply_to, "forum_topic", None)
+                    topic_id = _resolve_topic_id(reply_to_msg_id, reply_to_top_id)
 
                     yield RawMessage(
                         tg_msg_id=msg.id,
@@ -172,16 +177,15 @@ class TelegramReader:
                         saved_from_peer_id=saved_peer_id,
                         saved_from_msg_id=saved_msg_id,
                     )
-                    await asyncio.sleep(self.MESSAGE_PAUSE)
                 break
             except FloodWaitError as e:
                 wait = e.seconds + self.FLOOD_WAIT_EXTRA
                 logger.warning("FloodWait %s секунд", wait)
                 await asyncio.sleep(wait)
 
-    async def get_chat_info(self, tg_id: int) -> dict:
+    async def get_chat_info(self, tg_id: int | str) -> dict:
         from telethon.tl.functions.channels import GetFullChannelRequest
-        from telethon.tl.types import Channel, Chat
+        from telethon.tl.types import Channel
 
         entity = await self._client.get_entity(tg_id)
         linked_chat_id: int | None = None

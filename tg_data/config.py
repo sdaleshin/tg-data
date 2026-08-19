@@ -13,5 +13,9 @@ class Settings(BaseSettings):
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
 
+    request_pause: float = 1.0
+    pull_interval_seconds: int = 21600
+    backfill_resume_interval_seconds: int = 3600
+
 
 settings = Settings()

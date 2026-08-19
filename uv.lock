@@ -513,7 +513,7 @@ wheels = [
 [[package]]
 name = "tg-data"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "psycopg2-binary" },

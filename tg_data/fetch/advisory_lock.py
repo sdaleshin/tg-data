@@ -8,6 +8,10 @@ from sqlalchemy.orm import Session
 LOCK_ID = 7777_7777  # произвольный стабильный id
 
 
+class LockBusy(Exception):
+    """Другой процесс уже держит advisory lock."""
+
+
 @contextmanager
 def advisory_lock(session: Session):
     """Блокирует выполнение: только один процесс может работать с Telegram."""
@@ -16,7 +20,7 @@ def advisory_lock(session: Session):
     ).scalar()
 
     if not result:
-        raise RuntimeError(
+        raise LockBusy(
             "Другой процесс уже работает с Telegram. Дождитесь его завершения."
         )
 
