@@ -1,3 +1,22 @@
+x-app-common: &app-common
+  build:
+    context: .
+    target: prod
+  environment: &app-env
+    DATABASE_URL: postgresql://tgdata:tgdata@postgres:5432/tgdata
+    SESSION_PATH: /data/session
+    TELEGRAM_API_ID: ${TELEGRAM_API_ID:-0}
+    TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+    ARCHIVE_SINCE: ${ARCHIVE_SINCE:-2024-01-01}
+    REQUEST_PAUSE: ${REQUEST_PAUSE:-1.0}
+    PULL_INTERVAL_SECONDS: ${PULL_INTERVAL_SECONDS:-21600}
+    BACKFILL_RESUME_INTERVAL_SECONDS: ${BACKFILL_RESUME_INTERVAL_SECONDS:-3600}
+  volumes:
+    - tg_session:/data
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
   postgres:
     image: postgres:17
@@ -9,6 +28,53 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgdata -d tgdata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    <<: *app-common
+    command: alembic upgrade head
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scheduler:
+    <<: *app-common
+    command: tg scheduler
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  tg:
+    <<: *app-common
+    profiles: [cli]
+    stdin_open: true
+    tty: true
+    entrypoint: ["tg"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  tests:
+    build:
+      context: .
+      target: dev
+    profiles: [tools]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql://tgdata:tgdata@postgres:5432/tgdata_test
+      TEST_DATABASE_URL: postgresql://tgdata:tgdata@postgres:5432/tgdata_test
+    command: pytest -v
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
+  tg_session:
